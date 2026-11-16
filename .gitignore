@@ -1,0 +1,15 @@
+/target/
+/Peplos.exe
+/Peplos.exe.sha256
+/*.pdb
+*.kdb
+*.kdbx
+*.key
+*.keyx
+*.pfx
+*.p12
+*.pem
+.env
+.env.*
+settings.json
+sync-baselines/

@@ -1,0 +1,29 @@
+[package]
+name = "peplos"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "A fast native KeePass database manager for Windows"
+
+[dependencies]
+anyhow = "1.0"
+arboard = "3.7"
+base64 = "0.22"
+crossbeam-channel = "0.5"
+chrono = "0.4"
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "clipboard"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "ico"] }
+getrandom = "0.2"
+keepass-rs = { path = "vendor/keepass-rs" }
+quick-xml = "0.37"
+rfd = { version = "0.18", default-features = false }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+url = "2.5"
+uuid = { version = "1.16", features = ["v4"] }
+winit = { version = "0.30.13", default-features = false, features = ["rwh_06"] }
+zeroize = { version = "1.8", features = ["derive"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Security_Cryptography", "Win32_System_Memory", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }

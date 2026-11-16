@@ -1,0 +1,18 @@
+name: Windows checks
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.1
+          components: clippy
+      - name: Test locked dependencies
+        run: cargo test --locked --target x86_64-pc-windows-msvc
+      - name: Check release build
+        run: cargo build --locked --release --target x86_64-pc-windows-msvc
