@@ -50,6 +50,43 @@ pub fn compute_header_hmac(master_key: &[u8], header_bytes: &[u8]) -> DatabaseRe
 
 // ─── Stream Reader ───────────────────────────────────────────────
 
+pub fn standard_block_key(base: &[u8], index: u64) -> [u8; 64] {
+    use sha2::{Digest, Sha512};
+    let mut h = Sha512::new(); h.update(index.to_le_bytes()); h.update(base); h.finalize().into()
+}
+pub fn standard_header_hmac(base: &[u8], header: &[u8]) -> DatabaseResult<[u8; 32]> {
+    crate::crypto::HmacCompute::hmac_sha256(&standard_block_key(base, u64::MAX), header)
+        .map_err(|e| DatabaseError::EncryptionError(e.to_string()))
+}
+pub fn standard_read<R: Read>(reader: &mut R, base: &[u8]) -> DatabaseResult<Vec<u8>> {
+    let mut result = Vec::new();
+    for index in 0u64.. {
+        let mut stored = [0u8; 32]; reader.read_exact(&mut stored)?;
+        let size = reader.read_u32::<LittleEndian>()?;
+        if size > 16 * 1024 * 1024 { return Err(DatabaseError::InvalidFormat("HMAC block too large".into())); }
+        let mut data = vec![0; size as usize]; reader.read_exact(&mut data)?;
+        let mut message = Vec::with_capacity(12 + data.len());
+        message.extend_from_slice(&index.to_le_bytes()); message.extend_from_slice(&size.to_le_bytes()); message.extend_from_slice(&data);
+        let expected = crate::crypto::HmacCompute::hmac_sha256(&standard_block_key(base, index), &message)
+            .map_err(|e| DatabaseError::EncryptionError(e.to_string()))?;
+        if stored != expected { return Err(DatabaseError::DecryptionError("HMAC block mismatch".into())); }
+        if size == 0 { return Ok(result); }
+        result.extend_from_slice(&data);
+    }
+    unreachable!()
+}
+pub fn standard_write<W: Write>(writer: &mut W, base: &[u8], data: &[u8]) -> DatabaseResult<()> {
+    for (index, chunk) in data.chunks(HMAC_BLOCK_SIZE).chain(std::iter::once(&[][..])).enumerate() {
+        let index = index as u64; let size = chunk.len() as u32;
+        let mut message = Vec::with_capacity(12 + chunk.len());
+        message.extend_from_slice(&index.to_le_bytes()); message.extend_from_slice(&size.to_le_bytes()); message.extend_from_slice(chunk);
+        let hash = crate::crypto::HmacCompute::hmac_sha256(&standard_block_key(base, index), &message)
+            .map_err(|e| DatabaseError::EncryptionError(e.to_string()))?;
+        writer.write_all(&hash)?; writer.write_u32::<LittleEndian>(size)?; writer.write_all(chunk)?;
+    }
+    Ok(())
+}
+
 /// Read an HMAC block stream, verifying each block's integrity.
 pub fn read_hmac_block_stream<R: Read>(
     reader: &mut R,

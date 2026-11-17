@@ -4,6 +4,7 @@
 //!           → decrypt → inner header → decompress → inner stream → XML → Database
 
 use std::io::Read;
+use sha2::{Digest, Sha256, Sha512};
 
 use byteorder::{LittleEndian, ReadBytesExt};
 
@@ -11,11 +12,11 @@ use crate::crypto::compression::CompressionAlgorithm;
 use crate::crypto::inner_stream::create_inner_stream;
 use crate::kdbx::file::header::{
     header_field_4, inner_header_field_4, CrsAlgorithm, KdbxHeader4, KdbxInnerHeader4,
-    FILE_VERSION_4, KDBX_SIGNATURE_1, KDBX_SIGNATURE_2,
+    FILE_VERSION_4,
 };
 use crate::kdbx::file::reader::DatabaseReader;
 use crate::kdbx::kdf::create_kdf;
-use crate::kdbx::stream::hmac_block_stream::{compute_header_hmac, read_hmac_block_stream};
+use crate::kdbx::stream::hmac_block_stream::{compute_header_hmac, read_hmac_block_stream, standard_header_hmac, standard_read};
 use crate::kdbx::xml::KdbxXmlReader;
 use crate::model::db::composite_key::CompositeKey;
 use crate::model::db::database::{Database, DatabaseVersion};
@@ -26,58 +27,36 @@ pub fn read_kdbx4<R: Read>(
     reader: &mut R,
     composite_key: &CompositeKey,
 ) -> DatabaseResult<Database> {
-    // 1. Detect version and consume signature (12 bytes)
-    let version = DatabaseReader::detect_version(reader)?;
-    if version != DatabaseVersion::KDBX4 {
-        return Err(DatabaseError::InvalidVersion(format!(
-            "Expected KDBX4, got {version:?}"
-        )));
-    }
-
-    // 2. Read outer header (capturing bytes for HMAC verification)
-    // Note: Writer computes HMAC over signature(12) + outer_header.
-    // detect_version consumed 12 bytes of signature, so we prepend them.
     let mut header_buf = Vec::new();
-    header_buf.extend_from_slice(&KDBX_SIGNATURE_1.to_le_bytes());
-    header_buf.extend_from_slice(&KDBX_SIGNATURE_2.to_le_bytes());
-    header_buf.extend_from_slice(&FILE_VERSION_4.to_le_bytes());
-    let header = {
-        let mut tee = TeeReader::new(reader, &mut header_buf);
-        read_kdbx4_outer_header_from(&mut tee)?
+    let version = { let mut tee = TeeReader::new(reader, &mut header_buf); DatabaseReader::detect_version(&mut tee)? };
+    if version != DatabaseVersion::KDBX4 { return Err(DatabaseError::InvalidVersion("Expected KDBX4".into())); }
+    let header = { let mut tee = TeeReader::new(reader, &mut header_buf); read_kdbx4_outer_header_from(&mut tee)? };
+    let (master_key, hmac_base) = derive_master_key(composite_key, &header)?;
+    let mut first = [0u8; 32]; reader.read_exact(&mut first)?;
+    let standard = first.as_slice() == Sha256::digest(&header_buf).as_slice();
+    let encrypted = if standard {
+        let mut hmac = [0u8; 32]; reader.read_exact(&mut hmac)?;
+        if hmac != standard_header_hmac(&hmac_base, &header_buf)? { return Err(DatabaseError::DecryptionError("Header HMAC mismatch".into())); }
+        standard_read(reader, &hmac_base)?
+    } else {
+        if first != compute_header_hmac(&master_key, &header_buf)? { return Err(DatabaseError::DecryptionError("Header integrity check failed".into())); }
+        read_hmac_block_stream(reader, &master_key)?
     };
-
-    // 3. Derive master key
-    let master_key = derive_master_key(composite_key, &header)?;
-
-    // 4. Verify header HMAC (next 32 bytes)
-    let mut stored_hmac = [0u8; 32];
-    reader.read_exact(&mut stored_hmac)?;
-    let expected_hmac = compute_header_hmac(&master_key, &header_buf)?;
-    if stored_hmac != expected_hmac {
-        return Err(DatabaseError::DecryptionError(
-            "Header HMAC mismatch".into(),
-        ));
-    }
-
-    // 5. Read HMAC block stream → encrypted data
-    let encrypted = read_hmac_block_stream(reader, &master_key)?;
-
-    // 6. Decrypt
     let cipher = crate::crypto::cipher_engine::create_cipher_engine(header.encryption_algorithm);
-    let decrypted = cipher
-        .decrypt(&master_key, &header.encryption_iv, &encrypted)
+    let decrypted = cipher.decrypt(&master_key, &header.encryption_iv, &encrypted)
         .map_err(|e| DatabaseError::DecryptionError(e.to_string()))?;
-
-    // 7. Parse inner header
-    let mut cursor = std::io::Cursor::new(&decrypted);
+    let data = if standard && header.compression == CompressionAlgorithm::Gzip {
+        crate::crypto::compression::decompress(&decrypted)?
+    } else { decrypted };
+    let mut cursor = std::io::Cursor::new(&data);
     let mut inner = read_kdbx4_inner_header(&mut cursor)?;
-
-    // 8. Decompress remaining data
-    let compressed_data = &decrypted[cursor.position() as usize..];
-    let xml_bytes = match header.compression {
-        CompressionAlgorithm::Gzip => crate::crypto::compression::decompress(compressed_data)?,
-        CompressionAlgorithm::None => compressed_data.to_vec(),
-    };
+    if !inner.binaries.is_empty() {
+        return Err(DatabaseError::Unsupported("KDBX 4 attachments are not supported; database was not modified".into()));
+    }
+    let remaining = &data[cursor.position() as usize..];
+    let xml_bytes = if !standard && header.compression == CompressionAlgorithm::Gzip {
+        crate::crypto::compression::decompress(remaining)?
+    } else { remaining.to_vec() };
 
     // 9. Parse XML with inner stream cipher
     let mut inner_stream =
@@ -93,7 +72,11 @@ pub fn read_kdbx4<R: Read>(
     }
     let xml_str =
         std::str::from_utf8(&xml_bytes).map_err(|e| DatabaseError::InvalidFormat(e.to_string()))?;
-    let db = KdbxXmlReader::read(xml_str, inner_stream.as_mut())?;
+    let mut db = KdbxXmlReader::read(xml_str, inner_stream.as_mut())?;
+    // Preserve the outer-header cipher when the database is saved again.
+    db.encryption_algorithm = header.encryption_algorithm;
+    db.compression = header.compression;
+    db.kdf_parameters = header.kdf_parameters;
 
     Ok(db)
 }
@@ -102,7 +85,7 @@ pub fn read_kdbx4<R: Read>(
 fn derive_master_key(
     composite_key: &CompositeKey,
     header: &KdbxHeader4,
-) -> DatabaseResult<Vec<u8>> {
+) -> DatabaseResult<(Vec<u8>, Vec<u8>)> {
     let raw_key = composite_key.build_raw_key();
     if raw_key.is_empty() {
         return Err(DatabaseError::InvalidKey);
@@ -126,7 +109,9 @@ fn derive_master_key(
     let mut combined = Vec::with_capacity(header.master_seed.len() + transformed.len());
     combined.extend_from_slice(&header.master_seed);
     combined.extend_from_slice(&transformed);
-    Ok(crate::crypto::HashEngine::sha256(&combined).to_vec())
+    let master = crate::crypto::HashEngine::sha256(&combined).to_vec();
+    combined.push(1);
+    Ok((master, Sha512::digest(&combined).to_vec()))
 }
 
 /// Read KDBX 4.0 outer header from reader, TeeReader captures all bytes.
@@ -216,7 +201,7 @@ fn read_kdbx4_inner_header<R: Read>(reader: &mut R) -> DatabaseResult<KdbxInnerH
                 inner_header_field_4::INNER_RANDOM_STREAM_KEY => {
                     inner.inner_random_stream_key = data;
                 }
-                inner_header_field_4::BINARY if data.len() > 1 => {
+                inner_header_field_4::BINARY if !data.is_empty() => {
                     inner.binaries.push(crate::kdbx::file::header::KdbxBinary {
                         flags: data[0],
                         data: data[1..].to_vec(),

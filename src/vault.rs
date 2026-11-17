@@ -11,7 +11,7 @@ use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use keepass_rs::{
-    open_database, save_database, CompositeKey, Database, DatabaseVersion, Entry, Group, IconImage, IconImageCustom,
+    open_database, save_database, CompositeKey, Database, DatabaseVersion, EncryptionAlgorithm, Entry, Group, IconImage, IconImageCustom,
     IconImageStandard, NodeId, ProtectedString,
 };
 use sha2::{Digest, Sha256};
@@ -62,7 +62,7 @@ pub struct VaultSnapshot {
 }
 
 pub enum Command {
-    Create { path: PathBuf, password: Zeroizing<String> },
+    Create { path: PathBuf, password: Zeroizing<String>, encryption: EncryptionAlgorithm },
     Unlock {
         path: PathBuf,
         password: Zeroizing<String>,
@@ -198,9 +198,9 @@ fn worker_loop(rx: Receiver<Command>, tx: Sender<Event>, ctx: eframe::egui::Cont
     };
     while let Ok(command) = rx.recv() {
         let result = match command {
-            Command::Create { path, password } => {
+            Command::Create { path, password, encryption } => {
                 send(&tx, &ctx, Event::Progress("Создаю зашифрованную базу…".into()));
-                match create_database(&path, password) {
+                match create_database(&path, password, encryption) {
                     Ok((db, key)) => {
                         let snap = snapshot(&db);
                         vault.db = Some(db); vault.key = Some(key); vault.path = Some(path.clone());
@@ -513,11 +513,12 @@ fn mutate(vault: &mut Vault, action: impl FnOnce(&mut Database) -> Result<()>) -
     }
 }
 
-fn create_database(path: &Path, mut password: Zeroizing<String>) -> Result<(Database, CompositeKey)> {
+fn create_database(path: &Path, mut password: Zeroizing<String>, encryption: EncryptionAlgorithm) -> Result<(Database, CompositeKey)> {
     anyhow::ensure!(!password.is_empty(), "Мастер-пароль не может быть пустым");
     let key = CompositeKey::new().with_password(password.as_bytes());
     password.zeroize();
     let mut db = Database::new(DatabaseVersion::KDBX4);
+    db.encryption_algorithm = encryption;
     let mut root = Group::new(NodeId::new_uuid());
     root.title = "Peplos".into();
     db.root_group_id = Some(root.id);
@@ -525,6 +526,7 @@ fn create_database(path: &Path, mut password: Zeroizing<String>) -> Result<(Data
     let mut bytes = Vec::new();
     save_database(&mut bytes, &db, &key).context("Не удалось зашифровать новую базу")?;
     let check = open_database(bytes.as_slice(), &key).context("Проверка новой базы не прошла")?;
+    anyhow::ensure!(check.encryption_algorithm == encryption, "Алгоритм шифрования не совпадает");
     anyhow::ensure!(check.root_group_id == db.root_group_id, "Проверка новой базы не прошла");
     let parent = path.parent().context("Некорректный путь к базе")?;
     let temp = parent.join(format!(".peplos-{}.tmp", Uuid::new_v4()));
@@ -1088,15 +1090,22 @@ mod time_roundtrip_tests {
     fn new_database_roundtrip_and_no_overwrite() {
         let dir = std::env::temp_dir().join(format!("peplos-create-test-{}", Uuid::new_v4()));
         std::fs::create_dir(&dir).unwrap();
-        let path = dir.join("new.kdbx");
-        let (db, _) = create_database(&path, Zeroizing::new("test master password".into())).unwrap();
-        assert_eq!(db.group_count(), 1);
-        let original = std::fs::read(&path).unwrap();
-        let (reopened, _) = open(&path, Zeroizing::new("test master password".into()), None).unwrap();
-        assert_eq!(reopened.root_group_id, db.root_group_id);
-        assert!(open(&path, Zeroizing::new("incorrect".into()), None).is_err());
-        assert!(create_database(&path, Zeroizing::new("other".into())).is_err());
-        assert_eq!(std::fs::read(&path).unwrap(), original);
+        for algorithm in [EncryptionAlgorithm::AesRijndael, EncryptionAlgorithm::Twofish, EncryptionAlgorithm::ChaCha20] {
+            let path = dir.join(format!("{algorithm:?}.kdbx"));
+            let (db, _) = create_database(&path, Zeroizing::new("test master password".into()), algorithm).unwrap();
+            assert_eq!(db.group_count(), 1);
+            let original = std::fs::read(&path).unwrap();
+            let (reopened, _) = open(&path, Zeroizing::new("test master password".into()), None).unwrap();
+            assert_eq!(reopened.root_group_id, db.root_group_id);
+            assert_eq!(reopened.encryption_algorithm, algorithm);
+            let key = CompositeKey::new().with_password(b"test master password");
+            let mut saved_again = Vec::new();
+            save_database(&mut saved_again, &reopened, &key).unwrap();
+            assert_eq!(open_database(saved_again.as_slice(), &key).unwrap().encryption_algorithm, algorithm);
+            assert!(open(&path, Zeroizing::new("incorrect".into()), None).is_err());
+            assert!(create_database(&path, Zeroizing::new("other".into()), algorithm).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+        }
         std::fs::remove_dir_all(dir).unwrap();
     }
 

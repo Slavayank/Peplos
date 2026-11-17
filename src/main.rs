@@ -18,6 +18,7 @@ use eframe::egui::{
     RichText, Stroke, TextEdit, TextureHandle, TextureOptions, Vec2,
 };
 use sha2::{Digest, Sha256};
+use keepass_rs::EncryptionAlgorithm;
 #[cfg(windows)]
 use winit::platform::windows::WindowExtWindows;
 #[cfg(windows)]
@@ -84,6 +85,7 @@ struct UnlockDraft {
     focus_requested: bool,
     creating: bool,
     confirmation: String,
+    encryption: EncryptionAlgorithm,
 }
 
 impl Drop for UnlockDraft {
@@ -244,6 +246,7 @@ impl PeplosApp {
             focus_requested: false,
             creating: false,
             confirmation: String::new(),
+            encryption: EncryptionAlgorithm::AesRijndael,
         });
         let has_recent_database = unlock.is_some();
         let (command_tx, event_rx) = vault::spawn_worker(cc.egui_ctx.clone());
@@ -829,6 +832,7 @@ impl PeplosApp {
                 focus_requested: false,
                 creating: false,
                 confirmation: String::new(),
+                encryption: EncryptionAlgorithm::AesRijndael,
             });
         }
     }
@@ -842,7 +846,8 @@ impl PeplosApp {
         }
         self.error = None;
         self.unlock = Some(UnlockDraft { path, password: String::new(), key_file: None,
-            working: false, focus_requested: false, creating: true, confirmation: String::new() });
+            working: false, focus_requested: false, creating: true, confirmation: String::new(),
+            encryption: EncryptionAlgorithm::AesRijndael });
     }
 
     fn clear_expired_clipboard(&mut self, force: bool) {
@@ -875,11 +880,12 @@ impl PeplosApp {
         }
         draft.confirmation.zeroize();
         let creating = draft.creating;
+        let encryption = draft.encryption;
         let password = Zeroizing::new(std::mem::take(&mut draft.password));
         let path = draft.path.clone();
         let key_file = draft.key_file.clone();
         draft.working = true;
-        let command = if creating { Command::Create { path, password } } else {
+        let command = if creating { Command::Create { path, password, encryption } } else {
             let sync = self.sync_request(&path);
             Command::Unlock { path, password, key_file, sync }
         };
@@ -1020,15 +1026,11 @@ impl PeplosApp {
                 ui.add_space(20.0);
                 ui.image((self.logo.id(), Vec2::new(185.0, 48.0)));
                 ui.add_space(9.0);
-                ui.label(
-                    RichText::new("Ваша база — в одном быстром месте")
-                        .size(23.0)
-                        .strong()
-                        .color(WHITE),
-                );
+                // Preserve the former headline's vertical space.
+                ui.add_space(ui.fonts_mut(|fonts| fonts.row_height(&FontId::proportional(23.0))));
                 ui.add_space(5.0);
                 ui.label(
-                    RichText::new("Откройте базу KeePass или продолжите с недавней")
+                    RichText::new("Откройте базу KDBX 3.1 / 4.0 или создайте новую · AES-256, Twofish, ChaCha20")
                         .size(13.0)
                         .color(MUTED),
                 );
@@ -2032,7 +2034,7 @@ impl PeplosApp {
             .collapsible(false)
             .resizable(false)
             .title_bar(false)
-            .fixed_size([520.0, 380.0])
+            .fixed_size([520.0, if self.unlock.as_ref().is_some_and(|draft| draft.creating) { 450.0 } else { 380.0 }])
             .frame(
                 Frame::new()
                     .fill(SURFACE_RAISED)
@@ -2087,6 +2089,20 @@ impl PeplosApp {
                         if draft.creating {
                             ui.label(RichText::new("Повторите мастер-пароль").size(12.0).color(SECONDARY));
                             ui.add_sized([available, 42.0], TextEdit::singleline(&mut draft.confirmation).password(true).hint_text("Повторите пароль"));
+                            ui.add_space(12.0);
+                            ui.label(RichText::new("Алгоритм шифрования").size(12.0).color(SECONDARY));
+                            egui::ComboBox::from_id_salt("new_database_cipher")
+                                .selected_text(match draft.encryption {
+                                    EncryptionAlgorithm::AesRijndael => "AES-256 (рекомендуется)",
+                                    EncryptionAlgorithm::Twofish => "Twofish (для KeePass нужен плагин)",
+                                    EncryptionAlgorithm::ChaCha20 => "ChaCha20",
+                                })
+                                .width(available - 24.0)
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut draft.encryption, EncryptionAlgorithm::AesRijndael, "AES-256 (рекомендуется)");
+                                    ui.selectable_value(&mut draft.encryption, EncryptionAlgorithm::Twofish, "Twofish (для KeePass нужен плагин)");
+                                    ui.selectable_value(&mut draft.encryption, EncryptionAlgorithm::ChaCha20, "ChaCha20");
+                                });
                         }
                         if !draft.creating { ui.horizontal(|ui| {
                             if ui

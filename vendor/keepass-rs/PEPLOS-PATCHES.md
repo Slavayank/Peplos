@@ -9,3 +9,7 @@ This is the upstream `keepass-rs` 0.2.0 source with its original license retaine
 - KDBX 3.1 end-of-header marker bytes are consumed and validated before reading the AES-CBC payload.
 
 These changes keep KDBX 3.1 files compatible with KeePass instead of relying on a reader/writer pair that only agreed with itself.
+
+- KDBX 4.0 retains the outer-header cipher after opening so subsequent saves preserve the selected encryption algorithm.
+
+- KDBX 4 header hashes, HMAC block stream, key derivation and compression follow the KeePass format; authenticated legacy Peplos files remain readable. Files containing KDBX 4 attachments are rejected until attachment preservation is implemented.

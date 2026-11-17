@@ -4,6 +4,7 @@
 //!           → HMAC block stream → header HMAC → outer header → signature
 
 use std::io::Write;
+use sha2::{Digest, Sha256, Sha512};
 
 use byteorder::{LittleEndian, WriteBytesExt};
 
@@ -14,7 +15,7 @@ use crate::kdbx::file::header::{
     KDBX_SIGNATURE_2,
 };
 use crate::kdbx::kdf::create_kdf;
-use crate::kdbx::stream::hmac_block_stream::{compute_header_hmac, write_hmac_block_stream};
+use crate::kdbx::stream::hmac_block_stream::{standard_header_hmac, standard_write};
 use crate::kdbx::xml::KdbxXmlWriter;
 use crate::model::db::composite_key::CompositeKey;
 use crate::model::db::database::Database;
@@ -26,6 +27,12 @@ pub fn write_kdbx4<W: Write>(
     database: &Database,
     composite_key: &CompositeKey,
 ) -> DatabaseResult<()> {
+    fn contains_binary(entry: &crate::model::entry::Entry) -> bool {
+        !entry.binaries.is_empty() || entry.history.iter().any(contains_binary)
+    }
+    if database.entries.values().any(contains_binary) {
+        return Err(DatabaseError::Unsupported("KDBX 4 attachments are not supported; database was not modified".into()));
+    }
     // 1. Generate header parameters
     let master_seed = generate_random_bytes(32);
     let encryption_iv = generate_random_bytes(database.encryption_algorithm.iv_length());
@@ -55,22 +62,21 @@ pub fn write_kdbx4<W: Write>(
     combined.extend_from_slice(&master_seed);
     combined.extend_from_slice(&transformed);
     let master_key = crate::crypto::HashEngine::sha256(&combined).to_vec();
+    combined.push(1);
+    let hmac_base = Sha512::digest(&combined);
 
     // 3. Serialize XML with inner stream
     let mut inner_stream = create_inner_stream(CrsAlgorithm::ChaCha20, &inner_stream_key)?;
     let xml = KdbxXmlWriter::write(database, inner_stream.as_mut())?;
     let xml_bytes = xml.into_bytes();
 
-    // 4. Compress
-    let compressed = match database.compression {
-        CompressionAlgorithm::Gzip => crate::crypto::compression::compress(&xml_bytes)?,
-        CompressionAlgorithm::None => xml_bytes,
-    };
-
-    // 5. Build inner header + compressed data
     let mut plaintext = Vec::new();
     write_inner_header(&mut plaintext, &inner_stream_key)?;
-    plaintext.extend_from_slice(&compressed);
+    plaintext.extend_from_slice(&xml_bytes);
+    let plaintext = match database.compression {
+        CompressionAlgorithm::Gzip => crate::crypto::compression::compress(&plaintext)?,
+        CompressionAlgorithm::None => plaintext,
+    };
 
     // 6. Encrypt
     let cipher = crate::crypto::cipher_engine::create_cipher_engine(database.encryption_algorithm);
@@ -90,14 +96,15 @@ pub fn write_kdbx4<W: Write>(
     )?;
 
     // 8. Compute header HMAC
-    let header_hmac = compute_header_hmac(&master_key, &header_buf)?;
+    let header_hmac = standard_header_hmac(&hmac_base, &header_buf)?;
 
     // 9. Write HMAC block stream
     let mut hmac_stream = Vec::new();
-    write_hmac_block_stream(&mut hmac_stream, &master_key, &encrypted)?;
+    standard_write(&mut hmac_stream, &hmac_base, &encrypted)?;
 
     // 10. Write everything
     writer.write_all(&header_buf)?;
+    writer.write_all(&Sha256::digest(&header_buf))?;
     writer.write_all(&header_hmac)?;
     writer.write_all(&hmac_stream)?;
 
@@ -129,7 +136,7 @@ fn write_outer_header<W: Write>(
     write_header_field_4(w, header_field_4::ENCRYPTION_IV, encryption_iv)?;
     let kdf_bytes = kdf_params.serialize();
     write_header_field_4(w, header_field_4::KDF_PARAMETERS, &kdf_bytes)?;
-    write_header_field_4(w, header_field_4::END_OF_HEADER, &[])?;
+    write_header_field_4(w, header_field_4::END_OF_HEADER, &[13, 10, 13, 10])?;
     Ok(())
 }
 
